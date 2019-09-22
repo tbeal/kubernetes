@@ -1,5 +1,19 @@
-assignees:
+# See the OWNERS docs at https://go.k8s.io/owners
+
+reviewers:
+  - bentheelder
   - eparis
+  - jbeda
+  - Katharine
   - mikedanese
-  - roberthbailey
   - zmerlynn
+approvers:
+  - eparis
+  - jbeda
+  - mikedanese
+  - spiffxp
+  - zmerlynn
+emeritus_approvers:
+  - roberthbailey   # 2019-03-08
+labels:
+- sig/cluster-lifecycle

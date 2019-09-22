@@ -17,6 +17,7 @@ package blackfriday
 
 import (
 	"bytes"
+	"strings"
 )
 
 // Latex is a type that implements the Renderer interface for LaTeX output.
@@ -39,16 +40,17 @@ func (options *Latex) GetFlags() int {
 }
 
 // render code chunks using verbatim, or listings if we have a language
-func (options *Latex) BlockCode(out *bytes.Buffer, text []byte, lang string) {
-	if lang == "" {
+func (options *Latex) BlockCode(out *bytes.Buffer, text []byte, info string) {
+	if info == "" {
 		out.WriteString("\n\\begin{verbatim}\n")
 	} else {
+		lang := strings.Fields(info)[0]
 		out.WriteString("\n\\begin{lstlisting}[language=")
 		out.WriteString(lang)
 		out.WriteString("]\n")
 	}
 	out.Write(text)
-	if lang == "" {
+	if info == "" {
 		out.WriteString("\n\\end{verbatim}\n")
 	} else {
 		out.WriteString("\n\\end{lstlisting}\n")
@@ -259,7 +261,7 @@ func (options *Latex) FootnoteRef(out *bytes.Buffer, ref []byte, id int) {
 }
 
 func needsBackslash(c byte) bool {
-	for _, r := range []byte("_{}%$&\\~") {
+	for _, r := range []byte("_{}%$&\\~#") {
 		if c == r {
 			return true
 		}

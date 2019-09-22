@@ -1,4 +1,4 @@
-// Copyright 2016 CoreOS, Inc.
+// Copyright 2016 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,50 +15,87 @@
 package clientv3
 
 import (
-	"log"
-	"os"
+	"io/ioutil"
 	"sync"
+
+	"github.com/coreos/etcd/pkg/logutil"
 
 	"google.golang.org/grpc/grpclog"
 )
 
-type Logger grpclog.Logger
-
 var (
-	logger settableLogger
+	lgMu sync.RWMutex
+	lg   logutil.Logger
 )
 
 type settableLogger struct {
-	l  grpclog.Logger
+	l  grpclog.LoggerV2
 	mu sync.RWMutex
 }
 
 func init() {
-	// use go's standard logger by default like grpc
-	logger.mu.Lock()
-	logger.l = log.New(os.Stderr, "", log.LstdFlags)
-	grpclog.SetLogger(&logger)
-	logger.mu.Unlock()
+	// disable client side logs by default
+	lg = &settableLogger{}
+	SetLogger(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
 }
 
-func (s *settableLogger) Set(l Logger) {
-	s.mu.Lock()
-	logger.l = l
-	s.mu.Unlock()
+// SetLogger sets client-side Logger.
+func SetLogger(l grpclog.LoggerV2) {
+	lgMu.Lock()
+	lg = logutil.NewLogger(l)
+	// override grpclog so that any changes happen with locking
+	grpclog.SetLoggerV2(lg)
+	lgMu.Unlock()
 }
 
-func (s *settableLogger) Get() Logger {
+// GetLogger returns the current logutil.Logger.
+func GetLogger() logutil.Logger {
+	lgMu.RLock()
+	l := lg
+	lgMu.RUnlock()
+	return l
+}
+
+// NewLogger returns a new Logger with logutil.Logger.
+func NewLogger(gl grpclog.LoggerV2) logutil.Logger {
+	return &settableLogger{l: gl}
+}
+
+func (s *settableLogger) get() grpclog.LoggerV2 {
 	s.mu.RLock()
-	l := logger.l
+	l := s.l
 	s.mu.RUnlock()
 	return l
 }
 
-// implement the grpclog.Logger interface
+// implement the grpclog.LoggerV2 interface
 
-func (s *settableLogger) Fatal(args ...interface{})                 { s.Get().Fatal(args...) }
-func (s *settableLogger) Fatalf(format string, args ...interface{}) { s.Get().Fatalf(format, args...) }
-func (s *settableLogger) Fatalln(args ...interface{})               { s.Get().Fatalln(args...) }
-func (s *settableLogger) Print(args ...interface{})                 { s.Get().Print(args...) }
-func (s *settableLogger) Printf(format string, args ...interface{}) { s.Get().Printf(format, args...) }
-func (s *settableLogger) Println(args ...interface{})               { s.Get().Println(args...) }
+func (s *settableLogger) Info(args ...interface{})                 { s.get().Info(args...) }
+func (s *settableLogger) Infof(format string, args ...interface{}) { s.get().Infof(format, args...) }
+func (s *settableLogger) Infoln(args ...interface{})               { s.get().Infoln(args...) }
+func (s *settableLogger) Warning(args ...interface{})              { s.get().Warning(args...) }
+func (s *settableLogger) Warningf(format string, args ...interface{}) {
+	s.get().Warningf(format, args...)
+}
+func (s *settableLogger) Warningln(args ...interface{}) { s.get().Warningln(args...) }
+func (s *settableLogger) Error(args ...interface{})     { s.get().Error(args...) }
+func (s *settableLogger) Errorf(format string, args ...interface{}) {
+	s.get().Errorf(format, args...)
+}
+func (s *settableLogger) Errorln(args ...interface{})               { s.get().Errorln(args...) }
+func (s *settableLogger) Fatal(args ...interface{})                 { s.get().Fatal(args...) }
+func (s *settableLogger) Fatalf(format string, args ...interface{}) { s.get().Fatalf(format, args...) }
+func (s *settableLogger) Fatalln(args ...interface{})               { s.get().Fatalln(args...) }
+func (s *settableLogger) Print(args ...interface{})                 { s.get().Info(args...) }
+func (s *settableLogger) Printf(format string, args ...interface{}) { s.get().Infof(format, args...) }
+func (s *settableLogger) Println(args ...interface{})               { s.get().Infoln(args...) }
+func (s *settableLogger) V(l int) bool                              { return s.get().V(l) }
+func (s *settableLogger) Lvl(lvl int) grpclog.LoggerV2 {
+	s.mu.RLock()
+	l := s.l
+	s.mu.RUnlock()
+	if l.V(lvl) {
+		return s
+	}
+	return logutil.NewDiscardLogger()
+}

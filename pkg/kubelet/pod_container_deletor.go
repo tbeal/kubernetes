@@ -19,9 +19,9 @@ package kubelet
 import (
 	"sort"
 
-	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/util/wait"
 )
 
 const (
@@ -45,10 +45,8 @@ func newPodContainerDeletor(runtime kubecontainer.Runtime, containersToKeep int)
 	buffer := make(chan kubecontainer.ContainerID, containerDeletorBufferLimit)
 	go wait.Until(func() {
 		for {
-			select {
-			case id := <-buffer:
-				runtime.DeleteContainer(id)
-			}
+			id := <-buffer
+			runtime.DeleteContainer(id)
 		}
 	}, 0, wait.NeverStop)
 
@@ -58,47 +56,57 @@ func newPodContainerDeletor(runtime kubecontainer.Runtime, containersToKeep int)
 	}
 }
 
-// getContainersToDeleteInPod returns the exited containers in a pod whose name matches the name inferred from exitedContainerID, ordered by the creation time from the latest to the earliest.
-func (p *podContainerDeletor) getContainersToDeleteInPod(exitedContainerID string, podStatus *kubecontainer.PodStatus) containerStatusbyCreatedList {
-	var matchedContainer *kubecontainer.ContainerStatus
-	var exitedContainers []*kubecontainer.ContainerStatus
-	// Find all exited containers in the pod
+// getContainersToDeleteInPod returns the exited containers in a pod whose name matches the name inferred from filterContainerId (if not empty), ordered by the creation time from the latest to the earliest.
+// If filterContainerID is empty, all dead containers in the pod are returned.
+func getContainersToDeleteInPod(filterContainerID string, podStatus *kubecontainer.PodStatus, containersToKeep int) containerStatusbyCreatedList {
+	matchedContainer := func(filterContainerId string, podStatus *kubecontainer.PodStatus) *kubecontainer.ContainerStatus {
+		if filterContainerId == "" {
+			return nil
+		}
+		for _, containerStatus := range podStatus.ContainerStatuses {
+			if containerStatus.ID.ID == filterContainerId {
+				return containerStatus
+			}
+		}
+		return nil
+	}(filterContainerID, podStatus)
+
+	if filterContainerID != "" && matchedContainer == nil {
+		klog.Warningf("Container %q not found in pod's containers", filterContainerID)
+		return containerStatusbyCreatedList{}
+	}
+
+	// Find the exited containers whose name matches the name of the container with id being filterContainerId
+	var candidates containerStatusbyCreatedList
 	for _, containerStatus := range podStatus.ContainerStatuses {
 		if containerStatus.State != kubecontainer.ContainerStateExited {
 			continue
 		}
-		if containerStatus.ID.ID == exitedContainerID {
-			matchedContainer = containerStatus
-		}
-		exitedContainers = append(exitedContainers, containerStatus)
-	}
-	if matchedContainer == nil {
-		glog.Warningf("Container %q not found in pod's exited containers", exitedContainerID)
-		return containerStatusbyCreatedList{}
-	}
-
-	// Find the exited containers whose name matches the name of the container with id being exitedContainerID
-	var candidates containerStatusbyCreatedList
-	for _, containerStatus := range exitedContainers {
-		if matchedContainer.Name == containerStatus.Name {
+		if matchedContainer == nil || matchedContainer.Name == containerStatus.Name {
 			candidates = append(candidates, containerStatus)
 		}
 	}
-	if len(candidates) <= p.containersToKeep {
+
+	if len(candidates) <= containersToKeep {
 		return containerStatusbyCreatedList{}
 	}
-
 	sort.Sort(candidates)
-	return candidates[p.containersToKeep:]
+	return candidates[containersToKeep:]
 }
 
 // deleteContainersInPod issues container deletion requests for containers selected by getContainersToDeleteInPod.
-func (p *podContainerDeletor) deleteContainersInPod(exitedContainerID string, podStatus *kubecontainer.PodStatus) {
-	for _, candidate := range p.getContainersToDeleteInPod(exitedContainerID, podStatus) {
+func (p *podContainerDeletor) deleteContainersInPod(filterContainerID string, podStatus *kubecontainer.PodStatus, removeAll bool) {
+	containersToKeep := p.containersToKeep
+	if removeAll {
+		containersToKeep = 0
+		filterContainerID = ""
+	}
+
+	for _, candidate := range getContainersToDeleteInPod(filterContainerID, podStatus, containersToKeep) {
 		select {
 		case p.worker <- candidate.ID:
 		default:
-			glog.Warningf("Failed to issue the request to remove container %v", candidate.ID)
+			klog.Warningf("Failed to issue the request to remove container %v", candidate.ID)
 		}
 	}
 }

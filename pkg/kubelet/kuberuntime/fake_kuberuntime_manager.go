@@ -17,21 +17,26 @@ limitations under the License.
 package kuberuntime
 
 import (
-	"io/ioutil"
 	"net/http"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/apis/componentconfig"
-	"k8s.io/kubernetes/pkg/client/record"
-	internalApi "k8s.io/kubernetes/pkg/kubelet/api"
+	cadvisorapi "github.com/google/cadvisor/info/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	"k8s.io/kubernetes/pkg/credentialprovider"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
-	"k8s.io/kubernetes/pkg/kubelet/network"
-	nettest "k8s.io/kubernetes/pkg/kubelet/network/testing"
+	"k8s.io/kubernetes/pkg/kubelet/images"
+	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
-	kubetypes "k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/flowcontrol"
+	"k8s.io/kubernetes/pkg/kubelet/util/logreduction"
+)
+
+const (
+	fakeSeccompProfileRoot = "/fakeSeccompProfileRoot"
 )
 
 type fakeHTTP struct {
@@ -44,59 +49,66 @@ func (f *fakeHTTP) Get(url string) (*http.Response, error) {
 	return nil, f.err
 }
 
-// fakeRuntimeHelper implements kubecontainer.RuntimeHelper interfaces for testing purposes.
-type fakeRuntimeHelper struct{}
+type fakePodStateProvider struct {
+	existingPods map[types.UID]struct{}
+	runningPods  map[types.UID]struct{}
+}
 
-func (f *fakeRuntimeHelper) GenerateRunContainerOptions(pod *api.Pod, container *api.Container, podIP string) (*kubecontainer.RunContainerOptions, error) {
-	var opts kubecontainer.RunContainerOptions
-	if len(container.TerminationMessagePath) != 0 {
-		testPodContainerDir, err := ioutil.TempDir("", "fooPodContainerDir")
-		if err != nil {
-			return nil, err
-		}
-		opts.PodContainerDir = testPodContainerDir
+func newFakePodStateProvider() *fakePodStateProvider {
+	return &fakePodStateProvider{
+		existingPods: make(map[types.UID]struct{}),
+		runningPods:  make(map[types.UID]struct{}),
 	}
-	return &opts, nil
 }
 
-func (f *fakeRuntimeHelper) GetClusterDNS(pod *api.Pod) ([]string, []string, error) {
-	return nil, nil, nil
+func (f *fakePodStateProvider) IsPodDeleted(uid types.UID) bool {
+	_, found := f.existingPods[uid]
+	return !found
 }
 
-// This is not used by docker runtime.
-func (f *fakeRuntimeHelper) GeneratePodHostNameAndDomain(pod *api.Pod) (string, string, error) {
-	return "", "", nil
+func (f *fakePodStateProvider) IsPodTerminated(uid types.UID) bool {
+	_, found := f.runningPods[uid]
+	return !found
 }
 
-func (f *fakeRuntimeHelper) GetPodDir(kubetypes.UID) string {
-	return ""
-}
+func newFakeKubeRuntimeManager(runtimeService internalapi.RuntimeService, imageService internalapi.ImageManagerService, machineInfo *cadvisorapi.MachineInfo, osInterface kubecontainer.OSInterface, runtimeHelper kubecontainer.RuntimeHelper, keyring credentialprovider.DockerKeyring) (*kubeGenericRuntimeManager, error) {
+	recorder := &record.FakeRecorder{}
+	kubeRuntimeManager := &kubeGenericRuntimeManager{
+		recorder:            recorder,
+		cpuCFSQuota:         false,
+		cpuCFSQuotaPeriod:   metav1.Duration{Duration: time.Microsecond * 100},
+		livenessManager:     proberesults.NewManager(),
+		containerRefManager: kubecontainer.NewRefManager(),
+		machineInfo:         machineInfo,
+		osInterface:         osInterface,
+		runtimeHelper:       runtimeHelper,
+		runtimeService:      runtimeService,
+		imageService:        imageService,
+		keyring:             keyring,
+		seccompProfileRoot:  fakeSeccompProfileRoot,
+		internalLifecycle:   cm.NewFakeInternalContainerLifecycle(),
+		logReduction:        logreduction.NewLogReduction(identicalErrorDelay),
+	}
 
-func (f *fakeRuntimeHelper) GetExtraSupplementalGroupsForPod(pod *api.Pod) []int64 {
-	return nil
-}
+	typedVersion, err := runtimeService.Version(kubeRuntimeAPIVersion)
+	if err != nil {
+		return nil, err
+	}
 
-func NewFakeKubeRuntimeManager(runtimeService internalApi.RuntimeService, imageService internalApi.ImageManagerService) (*kubeGenericRuntimeManager, error) {
-	networkPlugin, _ := network.InitNetworkPlugin(
-		[]network.NetworkPlugin{},
-		"",
-		nettest.NewFakeHost(nil),
-		componentconfig.HairpinNone,
-		"10.0.0.0/8",
-	)
-
-	return NewKubeGenericRuntimeManager(
-		&record.FakeRecorder{},
-		proberesults.NewManager(),
-		kubecontainer.NewRefManager(),
-		&containertest.FakeOS{},
-		networkPlugin,
-		&fakeRuntimeHelper{},
-		&fakeHTTP{},
+	kubeRuntimeManager.containerGC = newContainerGC(runtimeService, newFakePodStateProvider(), kubeRuntimeManager)
+	kubeRuntimeManager.runtimeName = typedVersion.RuntimeName
+	kubeRuntimeManager.imagePuller = images.NewImageManager(
+		kubecontainer.FilterEventRecorder(recorder),
+		kubeRuntimeManager,
 		flowcontrol.NewBackOff(time.Second, 300*time.Second),
 		false,
-		false,
-		runtimeService,
-		imageService,
+		0, // Disable image pull throttling by setting QPS to 0,
+		0,
 	)
+	kubeRuntimeManager.runner = lifecycle.NewHandlerRunner(
+		&fakeHTTP{},
+		kubeRuntimeManager,
+		kubeRuntimeManager)
+
+	return kubeRuntimeManager, nil
 }

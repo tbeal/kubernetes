@@ -1,3 +1,5 @@
+// +build linux
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -28,87 +30,136 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"syscall"
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/client/typed/dynamic"
-	namespacecontroller "k8s.io/kubernetes/pkg/controller/namespace"
-	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/system"
 	commontest "k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2econfig "k8s.io/kubernetes/test/e2e/framework/config"
+	"k8s.io/kubernetes/test/e2e/framework/testfiles"
+	"k8s.io/kubernetes/test/e2e/generated"
+	"k8s.io/kubernetes/test/e2e_node/services"
 
-	"github.com/golang/glog"
-	. "github.com/onsi/ginkgo"
-	more_reporters "github.com/onsi/ginkgo/reporters"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/config"
+	morereporters "github.com/onsi/ginkgo/reporters"
+	"github.com/onsi/gomega"
+	"github.com/spf13/pflag"
+	"k8s.io/klog"
 )
 
-var e2es *e2eService
+var e2es *services.E2EServices
 
-// context is the test context shared by all parallel nodes.
-// Originally we setup the test environment and initialize global variables
-// in BeforeSuite, and then used the global variables in the test.
-// However, after we make the test parallel, ginkgo will run all tests
-// in several parallel test nodes. And for each test node, the BeforeSuite
-// and AfterSuite will be run.
-// We don't want to start services (kubelet, apiserver and etcd) for all
-// parallel nodes, but we do want to set some globally shared variable which
-// could be used in test.
-// We have to use SynchronizedBeforeSuite to achieve that. The first
-// function of SynchronizedBeforeSuite is only called once, and the second
-// function is called in each parallel test node. The result returned by
-// the first function will be the parameter of the second function.
-// So we'll start all services and initialize the shared context in the first
-// function, and propagate the context to all parallel test nodes in the
-// second function.
-// Notice no lock is needed for shared context, because context should only be
-// initialized in the first function in SynchronizedBeforeSuite. After that
-// it should never be modified.
-var context SharedContext
-
-var prePullImages = flag.Bool("prepull-images", true, "If true, prepull images so image pull failures do not cause test failures.")
-var junitFileNumber = flag.Int("junit-file-number", 1, "Used to create junit filename - e.g. junit_01.xml.")
+// TODO(random-liu): Change the following modes to sub-command.
+var runServicesMode = flag.Bool("run-services-mode", false, "If true, only run services (etcd, apiserver) in current process, and not run test.")
+var runKubeletMode = flag.Bool("run-kubelet-mode", false, "If true, only start kubelet, and not run test.")
+var systemValidateMode = flag.Bool("system-validate-mode", false, "If true, only run system validation in current process, and not run test.")
+var systemSpecFile = flag.String("system-spec-file", "", "The name of the system spec file that will be used for node conformance test. If it's unspecified or empty, the default system spec (system.DefaultSysSpec) will be used.")
 
 func init() {
-	framework.RegisterCommonFlags()
-	framework.RegisterNodeFlags()
+	e2econfig.CopyFlags(e2econfig.Flags, flag.CommandLine)
+	framework.RegisterCommonFlags(flag.CommandLine)
+	framework.RegisterNodeFlags(flag.CommandLine)
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
+	// Mark the run-services-mode flag as hidden to prevent user from using it.
+	pflag.CommandLine.MarkHidden("run-services-mode")
+	// It's weird that if I directly use pflag in TestContext, it will report error.
+	// It seems that someone is using flag.Parse() after init() and TestMain().
+	// TODO(random-liu): Find who is using flag.Parse() and cause errors and move the following logic
+	// into TestContext.
+	// TODO(pohly): remove RegisterNodeFlags from test_context.go enable Viper config support here?
+
+	// Enable bindata file lookup as fallback.
+	testfiles.AddFileSource(testfiles.BindataFileSource{
+		Asset:      generated.Asset,
+		AssetNames: generated.AssetNames,
+	})
+
 }
 
-func TestE2eNode(t *testing.T) {
-	flag.Parse()
+func TestMain(m *testing.M) {
+	rand.Seed(time.Now().UnixNano())
+	pflag.Parse()
+	framework.AfterReadingAllFlags(&framework.TestContext)
+	setExtraEnvs()
+	os.Exit(m.Run())
+}
 
-	rand.Seed(time.Now().UTC().UnixNano())
-	RegisterFailHandler(Fail)
-	reporters := []Reporter{}
-	if *reportDir != "" {
+// When running the containerized conformance test, we'll mount the
+// host root filesystem as readonly to /rootfs.
+const rootfs = "/rootfs"
+
+func TestE2eNode(t *testing.T) {
+	if *runServicesMode {
+		// If run-services-mode is specified, only run services in current process.
+		services.RunE2EServices(t)
+		return
+	}
+	if *runKubeletMode {
+		// If run-kubelet-mode is specified, only start kubelet.
+		services.RunKubelet()
+		return
+	}
+	if *systemValidateMode {
+		// If system-validate-mode is specified, only run system validation in current process.
+		spec := &system.DefaultSysSpec
+		if *systemSpecFile != "" {
+			var err error
+			spec, err = loadSystemSpecFromFile(*systemSpecFile)
+			if err != nil {
+				klog.Exitf("Failed to load system spec: %v", err)
+			}
+		}
+		if framework.TestContext.NodeConformance {
+			// Chroot to /rootfs to make system validation can check system
+			// as in the root filesystem.
+			// TODO(random-liu): Consider to chroot the whole test process to make writing
+			// test easier.
+			if err := syscall.Chroot(rootfs); err != nil {
+				klog.Exitf("chroot %q failed: %v", rootfs, err)
+			}
+		}
+		if _, err := system.ValidateSpec(*spec, framework.TestContext.ContainerRuntime); err != nil {
+			klog.Exitf("system validation failed: %v", err)
+		}
+		return
+	}
+	// If run-services-mode is not specified, run test.
+	gomega.RegisterFailHandler(ginkgo.Fail)
+	reporters := []ginkgo.Reporter{}
+	reportDir := framework.TestContext.ReportDir
+	if reportDir != "" {
 		// Create the directory if it doesn't already exists
-		if err := os.MkdirAll(*reportDir, 0755); err != nil {
-			glog.Errorf("Failed creating report directory: %v", err)
+		if err := os.MkdirAll(reportDir, 0755); err != nil {
+			klog.Errorf("Failed creating report directory: %v", err)
 		} else {
 			// Configure a junit reporter to write to the directory
-			junitFile := fmt.Sprintf("junit_%02d.xml", *junitFileNumber)
-			junitPath := path.Join(*reportDir, junitFile)
-			reporters = append(reporters, more_reporters.NewJUnitReporter(junitPath))
+			junitFile := fmt.Sprintf("junit_%s_%02d.xml", framework.TestContext.ReportPrefix, config.GinkgoConfig.ParallelNode)
+			junitPath := path.Join(reportDir, junitFile)
+			reporters = append(reporters, morereporters.NewJUnitReporter(junitPath))
 		}
 	}
-	RunSpecsWithDefaultAndCustomReporters(t, "E2eNode Suite", reporters)
+	ginkgo.RunSpecsWithDefaultAndCustomReporters(t, "E2eNode Suite", reporters)
 }
 
 // Setup the kubelet on the node
-var _ = SynchronizedBeforeSuite(func() []byte {
-	if *buildServices {
-		buildGo()
-	}
+var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
+	// Run system validation test.
+	gomega.Expect(validateSystem()).To(gomega.Succeed(), "system validation")
 
 	// Pre-pull the images tests depend on so we can fail immediately if there is an image pull issue
 	// This helps with debugging test flakes since it is hard to tell when a test failure is due to image pulling.
-	if *prePullImages {
-		glog.Infof("Pre-pulling images so that they are cached for the tests.")
+	if framework.TestContext.PrepullImages {
+		klog.Infof("Pre-pulling images so that they are cached for the tests.")
+		updateImageWhiteList()
 		err := PrePullAllImages()
-		Expect(err).ShouldNot(HaveOccurred())
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	}
 
 	// TODO(yifan): Temporary workaround to disable coreos from auto restart
@@ -116,85 +167,176 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	// We should mask locksmithd when provisioning the machine.
 	maskLocksmithdOnCoreos()
 
-	shared := &SharedContext{}
 	if *startServices {
-		e2es = newE2eService(framework.TestContext.NodeName, framework.TestContext.CgroupsPerQOS, shared)
-		if err := e2es.start(); err != nil {
-			Fail(fmt.Sprintf("Unable to start node services.\n%v", err))
-		}
-		glog.Infof("Node services started.  Running tests...")
+		// If the services are expected to stop after test, they should monitor the test process.
+		// If the services are expected to keep running after test, they should not monitor the test process.
+		e2es = services.NewE2EServices(*stopServices)
+		gomega.Expect(e2es.Start()).To(gomega.Succeed(), "should be able to start node services.")
+		klog.Infof("Node services started.  Running tests...")
 	} else {
-		glog.Infof("Running tests without starting services.")
+		klog.Infof("Running tests without starting services.")
 	}
 
-	glog.Infof("Starting namespace controller")
-	startNamespaceController()
+	klog.Infof("Wait for the node to be ready")
+	waitForNodeReady()
 
 	// Reference common test to make the import valid.
 	commontest.CurrentSuite = commontest.NodeE2E
 
-	data, err := json.Marshal(shared)
-	Expect(err).NotTo(HaveOccurred())
-
-	return data
-}, func(data []byte) {
-	// Set the shared context got from the synchronized initialize function
-	shared := &SharedContext{}
-	Expect(json.Unmarshal(data, shared)).To(Succeed())
-	context = *shared
-
-	if framework.TestContext.NodeName == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			glog.Fatalf("Could not get node name: %v", err)
-		}
-		framework.TestContext.NodeName = hostname
-	}
+	return nil
+}, func([]byte) {
+	// update test context with node configuration.
+	gomega.Expect(updateTestContext()).To(gomega.Succeed(), "update test context with node config.")
 })
 
 // Tear down the kubelet on the node
-var _ = SynchronizedAfterSuite(func() {}, func() {
+var _ = ginkgo.SynchronizedAfterSuite(func() {}, func() {
 	if e2es != nil {
-		e2es.getLogFiles()
 		if *startServices && *stopServices {
-			glog.Infof("Stopping node services...")
-			e2es.stop()
+			klog.Infof("Stopping node services...")
+			e2es.Stop()
 		}
 	}
 
-	glog.Infof("Tests Finished")
+	klog.Infof("Tests Finished")
 })
+
+// validateSystem runs system validation in a separate process and returns error if validation fails.
+func validateSystem() error {
+	testBin, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("can't get current binary: %v", err)
+	}
+	// Pass all flags into the child process, so that it will see the same flag set.
+	output, err := exec.Command(testBin, append([]string{"--system-validate-mode"}, os.Args[1:]...)...).CombinedOutput()
+	// The output of system validation should have been formatted, directly print here.
+	fmt.Print(string(output))
+	if err != nil {
+		return fmt.Errorf("system validation failed: %v", err)
+	}
+	return nil
+}
 
 func maskLocksmithdOnCoreos() {
 	data, err := ioutil.ReadFile("/etc/os-release")
 	if err != nil {
 		// Not all distros contain this file.
-		glog.Infof("Could not read /etc/os-release: %v", err)
+		klog.Infof("Could not read /etc/os-release: %v", err)
 		return
 	}
 	if bytes.Contains(data, []byte("ID=coreos")) {
-		if output, err := exec.Command("sudo", "systemctl", "mask", "--now", "locksmithd").CombinedOutput(); err != nil {
-			glog.Fatalf("Could not mask locksmithd: %v, output: %q", err, string(output))
-		}
-		glog.Infof("Locksmithd is masked successfully")
+		output, err := exec.Command("systemctl", "mask", "--now", "locksmithd").CombinedOutput()
+		framework.ExpectNoError(err, fmt.Sprintf("should be able to mask locksmithd - output: %q", string(output)))
+		klog.Infof("Locksmithd is masked successfully")
 	}
 }
 
-const (
-	// ncResyncPeriod is resync period of the namespace controller
-	ncResyncPeriod = 5 * time.Minute
-	// ncConcurrency is concurrency of the namespace controller
-	ncConcurrency = 2
-)
+func waitForNodeReady() {
+	const (
+		// nodeReadyTimeout is the time to wait for node to become ready.
+		nodeReadyTimeout = 2 * time.Minute
+		// nodeReadyPollInterval is the interval to check node ready.
+		nodeReadyPollInterval = 1 * time.Second
+	)
+	client, err := getAPIServerClient()
+	framework.ExpectNoError(err, "should be able to get apiserver client.")
+	gomega.Eventually(func() error {
+		node, err := getNode(client)
+		if err != nil {
+			return fmt.Errorf("failed to get node: %v", err)
+		}
+		if !isNodeReady(node) {
+			return fmt.Errorf("node is not ready: %+v", node)
+		}
+		return nil
+	}, nodeReadyTimeout, nodeReadyPollInterval).Should(gomega.Succeed())
+}
 
-func startNamespaceController() {
-	// Use the default QPS
-	config := restclient.AddUserAgent(&restclient.Config{Host: framework.TestContext.Host}, "node-e2e-namespace-controller")
+// updateTestContext updates the test context with the node name.
+// TODO(random-liu): Using dynamic kubelet configuration feature to
+// update test context with node configuration.
+func updateTestContext() error {
+	setExtraEnvs()
+	updateImageWhiteList()
+
+	client, err := getAPIServerClient()
+	if err != nil {
+		return fmt.Errorf("failed to get apiserver client: %v", err)
+	}
+	// Update test context with current node object.
+	node, err := getNode(client)
+	if err != nil {
+		return fmt.Errorf("failed to get node: %v", err)
+	}
+	framework.TestContext.NodeName = node.Name // Set node name.
+	// Update test context with current kubelet configuration.
+	// This assumes all tests which dynamically change kubelet configuration
+	// must: 1) run in serial; 2) restore kubelet configuration after test.
+	kubeletCfg, err := getCurrentKubeletConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubelet configuration: %v", err)
+	}
+	framework.TestContext.KubeletConfig = *kubeletCfg // Set kubelet config
+	return nil
+}
+
+// getNode gets node object from the apiserver.
+func getNode(c *clientset.Clientset) (*v1.Node, error) {
+	nodes, err := c.CoreV1().Nodes().List(metav1.ListOptions{})
+	framework.ExpectNoError(err, "should be able to list nodes.")
+	if nodes == nil {
+		return nil, fmt.Errorf("the node list is nil.")
+	}
+	gomega.Expect(len(nodes.Items) > 1).NotTo(gomega.BeTrue(), "the number of nodes is more than 1.")
+	if len(nodes.Items) == 0 {
+		return nil, fmt.Errorf("empty node list: %+v", nodes)
+	}
+	return &nodes.Items[0], nil
+}
+
+// getAPIServerClient gets a apiserver client.
+func getAPIServerClient() (*clientset.Clientset, error) {
+	config, err := framework.LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %v", err)
+	}
 	client, err := clientset.NewForConfig(config)
-	Expect(err).NotTo(HaveOccurred())
-	clientPool := dynamic.NewClientPool(config, dynamic.LegacyAPIPathResolverFunc)
-	resources, err := client.Discovery().ServerPreferredNamespacedResources()
-	Expect(err).NotTo(HaveOccurred())
-	nc := namespacecontroller.NewNamespaceController(client, clientPool, resources, ncResyncPeriod, api.FinalizerKubernetes)
-	go nc.Run(ncConcurrency, wait.NeverStop)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client: %v", err)
+	}
+	return client, nil
+}
+
+// loadSystemSpecFromFile returns the system spec from the file with the
+// filename.
+func loadSystemSpecFromFile(filename string) (*system.SysSpec, error) {
+	b, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	data, err := utilyaml.ToJSON(b)
+	if err != nil {
+		return nil, err
+	}
+	spec := new(system.SysSpec)
+	if err := json.Unmarshal(data, spec); err != nil {
+		return nil, err
+	}
+	return spec, nil
+}
+
+// isNodeReady returns true if a node is ready; false otherwise.
+func isNodeReady(node *v1.Node) bool {
+	for _, c := range node.Status.Conditions {
+		if c.Type == v1.NodeReady {
+			return c.Status == v1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func setExtraEnvs() {
+	for name, value := range framework.TestContext.ExtraEnvs {
+		os.Setenv(name, value)
+	}
 }

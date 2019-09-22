@@ -17,15 +17,19 @@ limitations under the License.
 package mount
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 // FakeMounter implements mount.Interface for tests.
 type FakeMounter struct {
 	MountPoints []MountPoint
 	Log         []FakeAction
+	// Error to return for a path when calling IsLikelyNotMountPoint
+	MountCheckErrors map[string]error
 	// Some tests run things in parallel, make sure the mounter does not produce
 	// any golang's DATA RACE warnings.
 	mutex sync.Mutex
@@ -33,9 +37,12 @@ type FakeMounter struct {
 
 var _ Interface = &FakeMounter{}
 
-// Values for FakeAction.Action
-const FakeActionMount = "mount"
-const FakeActionUnmount = "unmount"
+const (
+	// FakeActionMount is the string for specifying mount as FakeAction.Action
+	FakeActionMount = "mount"
+	// FakeActionUnmount is the string for specifying unmount as FakeAction.Action
+	FakeActionUnmount = "unmount"
+)
 
 // FakeAction objects are logged every time a fake mount or unmount is called.
 type FakeAction struct {
@@ -45,6 +52,7 @@ type FakeAction struct {
 	FSType string // applies only to "mount" actions
 }
 
+// ResetLog clears all the log entries in FakeMounter
 func (f *FakeMounter) ResetLog() {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -52,12 +60,15 @@ func (f *FakeMounter) ResetLog() {
 	f.Log = []FakeAction{}
 }
 
+// Mount records the mount event and updates the in-memory mount points for FakeMounter
 func (f *FakeMounter) Mount(source string, target string, fstype string, options []string) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
-	// find 'bind' option
+	opts := []string{}
+
 	for _, option := range options {
+		// find 'bind' option
 		if option == "bind" {
 			// This is a bind-mount. In order to mimic linux behaviour, we must
 			// use the original device of the bind-mount as the real source.
@@ -76,34 +87,49 @@ func (f *FakeMounter) Mount(source string, target string, fstype string, options
 					break
 				}
 			}
-			break
 		}
+		// reuse MountPoint.Opts field to mark mount as readonly
+		opts = append(opts, option)
 	}
 
-	f.MountPoints = append(f.MountPoints, MountPoint{Device: source, Path: target, Type: fstype})
-	glog.V(5).Infof("Fake mounter: mounted %s to %s", source, target)
-	f.Log = append(f.Log, FakeAction{Action: FakeActionMount, Target: target, Source: source, FSType: fstype})
+	// If target is a symlink, get its absolute path
+	absTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		absTarget = target
+	}
+	f.MountPoints = append(f.MountPoints, MountPoint{Device: source, Path: absTarget, Type: fstype, Opts: opts})
+	klog.V(5).Infof("Fake mounter: mounted %s to %s", source, absTarget)
+	f.Log = append(f.Log, FakeAction{Action: FakeActionMount, Target: absTarget, Source: source, FSType: fstype})
 	return nil
 }
 
+// Unmount records the unmount event and updates the in-memory mount points for FakeMounter
 func (f *FakeMounter) Unmount(target string) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
+	// If target is a symlink, get its absolute path
+	absTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		absTarget = target
+	}
+
 	newMountpoints := []MountPoint{}
 	for _, mp := range f.MountPoints {
-		if mp.Path == target {
-			glog.V(5).Infof("Fake mounter: unmounted %s from %s", mp.Device, target)
+		if mp.Path == absTarget {
+			klog.V(5).Infof("Fake mounter: unmounted %s from %s", mp.Device, absTarget)
 			// Don't copy it to newMountpoints
 			continue
 		}
 		newMountpoints = append(newMountpoints, MountPoint{Device: mp.Device, Path: mp.Path, Type: mp.Type})
 	}
 	f.MountPoints = newMountpoints
-	f.Log = append(f.Log, FakeAction{Action: FakeActionUnmount, Target: target})
+	f.Log = append(f.Log, FakeAction{Action: FakeActionUnmount, Target: absTarget})
+	delete(f.MountCheckErrors, target)
 	return nil
 }
 
+// List returns all the in-memory mountpoints for FakeMounter
 func (f *FakeMounter) List() ([]MountPoint, error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -111,32 +137,45 @@ func (f *FakeMounter) List() ([]MountPoint, error) {
 	return f.MountPoints, nil
 }
 
+// IsLikelyNotMountPoint determines whether a path is a mountpoint by checking
+// if the absolute path to file is in the in-memory mountpoints
 func (f *FakeMounter) IsLikelyNotMountPoint(file string) (bool, error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 
+	err := f.MountCheckErrors[file]
+	if err != nil {
+		return false, err
+	}
+
+	_, err = os.Stat(file)
+	if err != nil {
+		return true, err
+	}
+
+	// If file is a symlink, get its absolute path
+	absFile, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		absFile = file
+	}
+
 	for _, mp := range f.MountPoints {
-		if mp.Path == file {
-			glog.V(5).Infof("isLikelyMountPoint for %s: mounted %s, false", file, mp.Path)
+		if mp.Path == absFile {
+			klog.V(5).Infof("isLikelyNotMountPoint for %s: mounted %s, false", file, mp.Path)
 			return false, nil
 		}
 	}
-	glog.V(5).Infof("isLikelyMountPoint for %s: true", file)
+	klog.V(5).Infof("isLikelyNotMountPoint for %s: true", file)
 	return true, nil
 }
 
-func (f *FakeMounter) DeviceOpened(pathname string) (bool, error) {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-
-	for _, mp := range f.MountPoints {
-		if mp.Device == pathname {
-			return true, nil
-		}
+// GetMountRefs finds all mount references to the path, returns a
+// list of paths.
+func (f *FakeMounter) GetMountRefs(pathname string) ([]string, error) {
+	realpath, err := filepath.EvalSymlinks(pathname)
+	if err != nil {
+		// Ignore error in FakeMounter, because we actually didn't create files.
+		realpath = pathname
 	}
-	return false, nil
-}
-
-func (f *FakeMounter) PathIsDevice(pathname string) (bool, error) {
-	return true, nil
+	return getMountRefsByDev(f, realpath)
 }

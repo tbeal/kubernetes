@@ -17,30 +17,109 @@ limitations under the License.
 // A binary that can morph into all of the other kubernetes binaries. You can
 // also soft-link to it busybox style.
 //
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/cmd/km/km.go
 package main
 
 import (
+	goflag "flag"
+	"math/rand"
 	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/component-base/logs"
+	_ "k8s.io/component-base/metrics/prometheus/restclient" // for client metric registration
+	_ "k8s.io/component-base/metrics/prometheus/version"    // for version metric registration
+	cloudcontrollermanager "k8s.io/kubernetes/cmd/cloud-controller-manager/app"
+	kubeapiserver "k8s.io/kubernetes/cmd/kube-apiserver/app"
+	kubecontrollermanager "k8s.io/kubernetes/cmd/kube-controller-manager/app"
+	kubeproxy "k8s.io/kubernetes/cmd/kube-proxy/app"
+	kubescheduler "k8s.io/kubernetes/cmd/kube-scheduler/app"
+	kubelet "k8s.io/kubernetes/cmd/kubelet/app"
+	kubectl "k8s.io/kubernetes/pkg/kubectl/cmd"
 )
 
 func main() {
-	hk := HyperKube{
-		Name: "hyperkube",
-		Long: "This is an all-in-one binary that can run any of the various Kubernetes servers.",
+	rand.Seed(time.Now().UnixNano())
+
+	hyperkubeCommand, allCommandFns := NewHyperKubeCommand()
+
+	// TODO: once we switch everything over to Cobra commands, we can go back to calling
+	// cliflag.InitFlags() (by removing its pflag.Parse() call). For now, we have to set the
+	// normalize func and add the go flag set by hand.
+	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+	// cliflag.InitFlags()
+	logs.InitLogs()
+	defer logs.FlushLogs()
+
+	basename := filepath.Base(os.Args[0])
+	if err := commandFor(basename, hyperkubeCommand, allCommandFns).Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func commandFor(basename string, defaultCommand *cobra.Command, commands []func() *cobra.Command) *cobra.Command {
+	for _, commandFn := range commands {
+		command := commandFn()
+		if command.Name() == basename {
+			return command
+		}
+		for _, alias := range command.Aliases {
+			if alias == basename {
+				return command
+			}
+		}
 	}
 
-	hk.AddServer(NewKubectlServer())
-	hk.AddServer(NewKubeAPIServer())
-	hk.AddServer(NewKubeControllerManager())
-	hk.AddServer(NewScheduler())
-	hk.AddServer(NewKubelet())
-	hk.AddServer(NewKubeProxy())
+	return defaultCommand
+}
 
-	//Federation servers
-	hk.AddServer(NewFederationAPIServer())
-	hk.AddServer(NewFederationCMServer())
+// NewHyperKubeCommand is the entry point for hyperkube
+func NewHyperKubeCommand() (*cobra.Command, []func() *cobra.Command) {
+	// these have to be functions since the command is polymorphic. Cobra wants you to be top level
+	// command to get executed
+	apiserver := func() *cobra.Command { return kubeapiserver.NewAPIServerCommand() }
+	controller := func() *cobra.Command { return kubecontrollermanager.NewControllerManagerCommand() }
+	proxy := func() *cobra.Command { return kubeproxy.NewProxyCommand() }
+	scheduler := func() *cobra.Command { return kubescheduler.NewSchedulerCommand() }
+	kubectlCmd := func() *cobra.Command { return kubectl.NewDefaultKubectlCommand() }
+	kubelet := func() *cobra.Command { return kubelet.NewKubeletCommand() }
+	cloudController := func() *cobra.Command {
+		cmd := cloudcontrollermanager.NewCloudControllerManagerCommand()
+		cmd.Deprecated = "please use the cloud controller manager specific " +
+			"to your external cloud provider"
+		return cmd
+	}
 
-	hk.RunToExit(os.Args)
+	commandFns := []func() *cobra.Command{
+		apiserver,
+		controller,
+		proxy,
+		scheduler,
+		kubectlCmd,
+		kubelet,
+		cloudController,
+	}
+
+	cmd := &cobra.Command{
+		Use:   "hyperkube",
+		Short: "Request a new project",
+		Run: func(cmd *cobra.Command, args []string) {
+			if len(args) != 0 {
+				cmd.Help()
+				os.Exit(1)
+			}
+
+		},
+	}
+
+	for i := range commandFns {
+		cmd.AddCommand(commandFns[i]())
+	}
+
+	return cmd, commandFns
 }

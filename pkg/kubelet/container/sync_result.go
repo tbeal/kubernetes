@@ -20,7 +20,7 @@ import (
 	"errors"
 	"fmt"
 
-	utilerrors "k8s.io/kubernetes/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 // TODO(random-liu): We need to better organize runtime errors for introspection.
@@ -39,6 +39,9 @@ var (
 	ErrKillContainer    = errors.New("KillContainerError")
 	ErrVerifyNonRoot    = errors.New("VerifyNonRootError")
 	ErrRunInitContainer = errors.New("RunInitContainerError")
+	ErrCreatePodSandbox = errors.New("CreatePodSandboxError")
+	ErrConfigPodSandbox = errors.New("ConfigPodSandboxError")
+	ErrKillPodSandbox   = errors.New("KillPodSandboxError")
 )
 
 var (
@@ -51,11 +54,14 @@ var (
 type SyncAction string
 
 const (
-	StartContainer  SyncAction = "StartContainer"
-	KillContainer   SyncAction = "KillContainer"
-	SetupNetwork    SyncAction = "SetupNetwork"
-	TeardownNetwork SyncAction = "TeardownNetwork"
-	InitContainer   SyncAction = "InitContainer"
+	StartContainer   SyncAction = "StartContainer"
+	KillContainer    SyncAction = "KillContainer"
+	SetupNetwork     SyncAction = "SetupNetwork"
+	TeardownNetwork  SyncAction = "TeardownNetwork"
+	InitContainer    SyncAction = "InitContainer"
+	CreatePodSandbox SyncAction = "CreatePodSandbox"
+	ConfigPodSandbox SyncAction = "ConfigPodSandbox"
+	KillPodSandbox   SyncAction = "KillPodSandbox"
 )
 
 // SyncResult is the result of sync action.
@@ -110,11 +116,11 @@ func (p *PodSyncResult) Fail(err error) {
 func (p *PodSyncResult) Error() error {
 	errlist := []error{}
 	if p.SyncError != nil {
-		errlist = append(errlist, fmt.Errorf("failed to SyncPod: %v\n", p.SyncError))
+		errlist = append(errlist, fmt.Errorf("failed to SyncPod: %v", p.SyncError))
 	}
 	for _, result := range p.SyncResults {
 		if result.Error != nil {
-			errlist = append(errlist, fmt.Errorf("failed to %q for %q with %v: %q\n", result.Action, result.Target,
+			errlist = append(errlist, fmt.Errorf("failed to %q for %q with %v: %q", result.Action, result.Target,
 				result.Error, result.Message))
 		}
 	}

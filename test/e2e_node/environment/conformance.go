@@ -45,11 +45,11 @@ func init() {
 	// Set this to false to undo util/logs.go settings it to true.  Prevents cadvisor log spam.
 	// Remove this once util/logs.go stops setting the flag to true.
 	flag.Set("logtostderr", "false")
-	flag.Parse()
 }
 
 // TODO: Should we write an e2e test for this?
 func main() {
+	flag.Parse()
 	o := strings.Split(*checkFlag, ",")
 	errs := check(o...)
 	if len(errs) > 0 {
@@ -81,8 +81,8 @@ func check(options ...string) []error {
 		case "kernel":
 			errs = appendNotNil(errs, kernel())
 		default:
-			fmt.Printf("Unrecognized option %s", c)
-			errs = append(errs, errors.New(fmt.Sprintf("Unrecognized option %s", c)))
+			fmt.Printf("Unrecognized option %s\n", c)
+			errs = append(errs, fmt.Errorf("Unrecognized option %s", c))
 		}
 	}
 	return errs
@@ -99,7 +99,7 @@ func containerRuntime() error {
 	}
 
 	// Setup cadvisor to check the container environment
-	c, err := cadvisor.New(0 /*don't start the http server*/, "docker")
+	c, err := cadvisor.New(cadvisor.NewImageFsInfoProvider("docker", ""), "/var/lib/kubelet", []string{"/"}, false)
 	if err != nil {
 		return printError("Container Runtime Check: %s Could not start cadvisor %v", failed, err)
 	}
@@ -119,12 +119,12 @@ func containerRuntime() error {
 	return printSuccess("Container Runtime Check: %s", success)
 }
 
-const kubeletClusterDnsRegexStr = `\/kubelet.*--cluster-dns=(\S+) `
+const kubeletClusterDNSRegexStr = `\/kubelet.*--cluster-dns=(\S+) `
 const kubeletClusterDomainRegexStr = `\/kubelet.*--cluster-domain=(\S+)`
 
 // dns checks that cluster dns has been properly configured and can resolve the kubernetes.default service
 func dns() error {
-	dnsRegex, err := regexp.Compile(kubeletClusterDnsRegexStr)
+	dnsRegex, err := regexp.Compile(kubeletClusterDNSRegexStr)
 	if err != nil {
 		// This should never happen and can only be fixed by changing the code
 		panic(err)
@@ -144,6 +144,10 @@ func dns() error {
 	}
 
 	kubecmd, err := exec.Command("ps", "aux").CombinedOutput()
+	if err != nil {
+		// Executing ps aux shouldn't have failed
+		panic(err)
+	}
 
 	// look for the dns flag and parse the value
 	dns := dnsRegex.FindStringSubmatch(string(kubecmd))
@@ -195,7 +199,7 @@ const iptablesForwardRegexStr = `Chain FORWARD \(policy DROP\)`
 func firewall() error {
 	out, err := exec.Command("iptables", "-L", "INPUT").CombinedOutput()
 	if err != nil {
-		return printSuccess("Firewall Iptables Check %s: Could not run iptables", skipped)
+		return printSuccess("Firewall IPTables Check %s: Could not run iptables", skipped)
 	}
 	inputRegex, err := regexp.Compile(iptablesInputRegexStr)
 	if err != nil {
@@ -203,13 +207,13 @@ func firewall() error {
 		panic(err)
 	}
 	if inputRegex.Match(out) {
-		return printError("Firewall Iptables Check %s: Found INPUT rule matching %s", failed, iptablesInputRegexStr)
+		return printError("Firewall IPTables Check %s: Found INPUT rule matching %s", failed, iptablesInputRegexStr)
 	}
 
 	// Check GCE forward rules
 	out, err = exec.Command("iptables", "-L", "FORWARD").CombinedOutput()
 	if err != nil {
-		return printSuccess("Firewall Iptables Check %s: Could not run iptables", skipped)
+		return printSuccess("Firewall IPTables Check %s: Could not run iptables", skipped)
 	}
 	forwardRegex, err := regexp.Compile(iptablesForwardRegexStr)
 	if err != nil {
@@ -217,10 +221,10 @@ func firewall() error {
 		panic(err)
 	}
 	if forwardRegex.Match(out) {
-		return printError("Firewall Iptables Check %s: Found FORWARD rule matching %s", failed, iptablesInputRegexStr)
+		return printError("Firewall IPTables Check %s: Found FORWARD rule matching %s", failed, iptablesInputRegexStr)
 	}
 
-	return printSuccess("Firewall Iptables Check %s", success)
+	return printSuccess("Firewall IPTables Check %s", success)
 }
 
 // daemons checks that the required node programs are running: kubelet, kube-proxy, and docker

@@ -14,38 +14,53 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package framework contains provider-independent helper code for
+// building and running E2E tests with Ginkgo. The actual Ginkgo test
+// suites gets assembled by combining this framework, the optional
+// provider support code and specific tests via a separate .go file
+// like Kubernetes' test/e2e.go.
 package framework
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
-	"reflect"
+	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/federation/client/clientset_generated/federation_internalclientset"
-	unversionedfederation "k8s.io/kubernetes/federation/client/clientset_generated/federation_internalclientset/typed/federation/unversioned"
-	"k8s.io/kubernetes/federation/client/clientset_generated/federation_release_1_3"
-	"k8s.io/kubernetes/pkg/api"
-	apierrs "k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/release_1_3"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/metrics"
-	"k8s.io/kubernetes/pkg/util/intstr"
-	"k8s.io/kubernetes/pkg/util/wait"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
+	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
+	scaleclient "k8s.io/client-go/scale"
+	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2epsp "k8s.io/kubernetes/test/e2e/framework/psp"
+	testutils "k8s.io/kubernetes/test/utils"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	yaml "gopkg.in/yaml.v2"
+	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
 )
 
 const (
 	maxKubectlExecRetries = 5
+	// DefaultNamespaceDeletionTimeout is timeout duration for waiting for a namespace deletion.
+	// TODO(mikedanese): reset this to 5 minutes once #47135 is resolved.
+	// ref https://github.com/kubernetes/kubernetes/issues/47135
+	DefaultNamespaceDeletionTimeout = 10 * time.Minute
 )
 
 // Framework supports common operations used by e2e tests; it will keep a client & a namespace for you.
@@ -53,29 +68,36 @@ const (
 type Framework struct {
 	BaseName string
 
-	Client        *client.Client
-	Clientset_1_2 *release_1_2.Clientset
-	Clientset_1_3 *release_1_3.Clientset
+	// Set together with creating the ClientSet and the namespace.
+	// Guaranteed to be unique in the cluster even when running the same
+	// test multiple times in parallel.
+	UniqueName string
 
-	// TODO(mml): Remove this.  We should generally use the versioned clientset.
-	FederationClientset     *federation_internalclientset.Clientset
-	FederationClientset_1_3 *federation_release_1_3.Clientset
-	// TODO: remove FederationClient, all the client access must be through FederationClientset
-	FederationClient *unversionedfederation.FederationClient
+	ClientSet                        clientset.Interface
+	KubemarkExternalClusterClientSet clientset.Interface
 
-	Namespace                *api.Namespace   // Every test has at least one namespace
-	namespacesToDelete       []*api.Namespace // Some tests have more than one.
+	DynamicClient dynamic.Interface
+
+	ScalesGetter scaleclient.ScalesGetter
+
+	SkipNamespaceCreation    bool            // Whether to skip creating a namespace
+	Namespace                *v1.Namespace   // Every test has at least one namespace unless creation is skipped
+	namespacesToDelete       []*v1.Namespace // Some tests have more than one.
 	NamespaceDeletionTimeout time.Duration
+	SkipPrivilegedPSPBinding bool // Whether to skip creating a binding to the privileged PSP in the test namespace
 
-	gatherer *containerResourceGatherer
+	gatherer *ContainerResourceGatherer
 	// Constraints that passed to a check which is executed after data is gathered to
-	// see if 99% of results are within acceptable bounds. It as to be injected in the test,
-	// as expectations vary greatly. Constraints are groupped by the container names.
+	// see if 99% of results are within acceptable bounds. It has to be injected in the test,
+	// as expectations vary greatly. Constraints are grouped by the container names.
 	AddonResourceConstraints map[string]ResourceConstraint
 
 	logsSizeWaitGroup    sync.WaitGroup
 	logsSizeCloseChannel chan bool
 	logsSizeVerifier     *LogsSizeVerifier
+
+	// Flaky operation failures in an e2e test can be captured through this.
+	flakeReport *FlakeReport
 
 	// To make sure that this framework cleans up after itself, no matter what,
 	// we install a Cleanup action before each test and clear it after.  If we
@@ -83,48 +105,51 @@ type Framework struct {
 	cleanupHandle CleanupActionHandle
 
 	// configuration for framework's client
-	options FrameworkOptions
+	Options Options
 
-	// will this framework exercise a federated cluster as well
-	federated bool
+	// Place where various additional data is stored during test run to be printed to ReportDir,
+	// or stdout if ReportDir is not set once test ends.
+	TestSummaries []TestDataSummary
+
+	// Place to keep ClusterAutoscaler metrics from before test in order to compute delta.
+	clusterAutoscalerMetricsBeforeTest e2emetrics.Collection
 }
 
+// TestDataSummary is an interface for managing test data.
 type TestDataSummary interface {
+	SummaryKind() string
 	PrintHumanReadable() string
 	PrintJSON() string
 }
 
-type FrameworkOptions struct {
-	ClientQPS   float32
-	ClientBurst int
+// Options is a struct for managing test framework options.
+type Options struct {
+	ClientQPS    float32
+	ClientBurst  int
+	GroupVersion *schema.GroupVersion
 }
 
-// NewFramework makes a new framework and sets up a BeforeEach/AfterEach for
+// NewDefaultFramework makes a new framework and sets up a BeforeEach/AfterEach for
 // you (you can write additional before/after each functions).
 func NewDefaultFramework(baseName string) *Framework {
-	options := FrameworkOptions{
+	options := Options{
 		ClientQPS:   20,
 		ClientBurst: 50,
 	}
 	return NewFramework(baseName, options, nil)
 }
 
-func NewDefaultFederatedFramework(baseName string) *Framework {
-	f := NewDefaultFramework(baseName)
-	f.federated = true
-	return f
-}
-
-func NewFramework(baseName string, options FrameworkOptions, client *client.Client) *Framework {
+// NewFramework creates a test framework.
+func NewFramework(baseName string, options Options, client clientset.Interface) *Framework {
 	f := &Framework{
 		BaseName:                 baseName,
 		AddonResourceConstraints: make(map[string]ResourceConstraint),
-		options:                  options,
-		Client:                   client,
+		Options:                  options,
+		ClientSet:                client,
 	}
 
-	BeforeEach(f.BeforeEach)
-	AfterEach(f.AfterEach)
+	ginkgo.BeforeEach(f.BeforeEach)
+	ginkgo.AfterEach(f.AfterEach)
 
 	return f
 }
@@ -134,74 +159,102 @@ func (f *Framework) BeforeEach() {
 	// The fact that we need this feels like a bug in ginkgo.
 	// https://github.com/onsi/ginkgo/issues/222
 	f.cleanupHandle = AddCleanupAction(f.AfterEach)
-	if f.Client == nil {
-		By("Creating a kubernetes client")
+	if f.ClientSet == nil {
+		ginkgo.By("Creating a kubernetes client")
 		config, err := LoadConfig()
-		Expect(err).NotTo(HaveOccurred())
-		config.QPS = f.options.ClientQPS
-		config.Burst = f.options.ClientBurst
+		ExpectNoError(err)
+		testDesc := ginkgo.CurrentGinkgoTestDescription()
+		if len(testDesc.ComponentTexts) > 0 {
+			componentTexts := strings.Join(testDesc.ComponentTexts, " ")
+			config.UserAgent = fmt.Sprintf(
+				"%v -- %v",
+				rest.DefaultKubernetesUserAgent(),
+				componentTexts)
+		}
+
+		config.QPS = f.Options.ClientQPS
+		config.Burst = f.Options.ClientBurst
+		if f.Options.GroupVersion != nil {
+			config.GroupVersion = f.Options.GroupVersion
+		}
 		if TestContext.KubeAPIContentType != "" {
 			config.ContentType = TestContext.KubeAPIContentType
 		}
-		c, err := loadClientFromConfig(config)
-		Expect(err).NotTo(HaveOccurred())
-		f.Client = c
-		f.Clientset_1_2, err = release_1_2.NewForConfig(config)
-		Expect(err).NotTo(HaveOccurred())
-		f.Clientset_1_3, err = release_1_3.NewForConfig(config)
-		Expect(err).NotTo(HaveOccurred())
+		f.ClientSet, err = clientset.NewForConfig(config)
+		ExpectNoError(err)
+		f.DynamicClient, err = dynamic.NewForConfig(config)
+		ExpectNoError(err)
+		// node.k8s.io is based on CRD, which is served only as JSON
+		jsonConfig := config
+		jsonConfig.ContentType = "application/json"
+		ExpectNoError(err)
+
+		// create scales getter, set GroupVersion and NegotiatedSerializer to default values
+		// as they are required when creating a REST client.
+		if config.GroupVersion == nil {
+			config.GroupVersion = &schema.GroupVersion{}
+		}
+		if config.NegotiatedSerializer == nil {
+			config.NegotiatedSerializer = scheme.Codecs
+		}
+		restClient, err := rest.RESTClientFor(config)
+		ExpectNoError(err)
+		discoClient, err := discovery.NewDiscoveryClientForConfig(config)
+		ExpectNoError(err)
+		cachedDiscoClient := cacheddiscovery.NewMemCacheClient(discoClient)
+		restMapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscoClient)
+		restMapper.Reset()
+		resolver := scaleclient.NewDiscoveryScaleKindResolver(cachedDiscoClient)
+		f.ScalesGetter = scaleclient.New(restClient, restMapper, dynamic.LegacyAPIPathResolverFunc, resolver)
+
+		TestContext.CloudConfig.Provider.FrameworkBeforeEach(f)
 	}
 
-	if f.federated {
-		if f.FederationClient == nil {
-			By("Creating a federated kubernetes client")
-			var err error
-			f.FederationClient, err = LoadFederationClient()
-			Expect(err).NotTo(HaveOccurred())
-		}
-		if f.FederationClientset == nil {
-			By("Creating an unversioned federation Clientset")
-			var err error
-			f.FederationClientset, err = LoadFederationClientset()
-			Expect(err).NotTo(HaveOccurred())
-		}
-		if f.FederationClientset_1_3 == nil {
-			By("Creating a release 1.3 federation Clientset")
-			var err error
-			f.FederationClientset_1_3, err = LoadFederationClientset_1_3()
-			Expect(err).NotTo(HaveOccurred())
-		}
-		By("Waiting for federation-apiserver to be ready")
-		err := WaitForFederationApiserverReady(f.FederationClientset)
-		Expect(err).NotTo(HaveOccurred())
-		By("federation-apiserver is ready")
-	}
+	if !f.SkipNamespaceCreation {
+		ginkgo.By(fmt.Sprintf("Building a namespace api object, basename %s", f.BaseName))
+		namespace, err := f.CreateNamespace(f.BaseName, map[string]string{
+			"e2e-framework": f.BaseName,
+		})
+		ExpectNoError(err)
 
-	By("Building a namespace api object")
-	namespace, err := f.CreateNamespace(f.BaseName, map[string]string{
-		"e2e-framework": f.BaseName,
-	})
-	Expect(err).NotTo(HaveOccurred())
+		f.Namespace = namespace
 
-	f.Namespace = namespace
-
-	if TestContext.VerifyServiceAccount {
-		By("Waiting for a default service account to be provisioned in namespace")
-		err = WaitForDefaultServiceAccountInNamespace(f.Client, namespace.Name)
-		Expect(err).NotTo(HaveOccurred())
+		if TestContext.VerifyServiceAccount {
+			ginkgo.By("Waiting for a default service account to be provisioned in namespace")
+			err = WaitForDefaultServiceAccountInNamespace(f.ClientSet, namespace.Name)
+			ExpectNoError(err)
+		} else {
+			Logf("Skipping waiting for service account")
+		}
+		f.UniqueName = f.Namespace.GetName()
 	} else {
-		Logf("Skipping waiting for service account")
+		// not guaranteed to be unique, but very likely
+		f.UniqueName = fmt.Sprintf("%s-%08x", f.BaseName, rand.Int31())
 	}
 
 	if TestContext.GatherKubeSystemResourceUsageData != "false" && TestContext.GatherKubeSystemResourceUsageData != "none" {
-		f.gatherer, err = NewResourceUsageGatherer(f.Client, ResourceGathererOptions{
-			inKubemark: ProviderIs("kubemark"),
-			masterOnly: TestContext.GatherKubeSystemResourceUsageData == "master",
-		})
+		var err error
+		var nodeMode NodesSet
+		switch TestContext.GatherKubeSystemResourceUsageData {
+		case "master":
+			nodeMode = MasterNodes
+		case "masteranddns":
+			nodeMode = MasterAndDNSNodes
+		default:
+			nodeMode = AllNodes
+		}
+
+		f.gatherer, err = NewResourceUsageGatherer(f.ClientSet, ResourceGathererOptions{
+			InKubemark:                  ProviderIs("kubemark"),
+			Nodes:                       nodeMode,
+			ResourceDataGatheringPeriod: 60 * time.Second,
+			ProbeDuration:               15 * time.Second,
+			PrintVerboseLogs:            false,
+		}, nil)
 		if err != nil {
 			Logf("Error while creating NewResourceUsageGatherer: %v", err)
 		} else {
-			go f.gatherer.startGatheringData()
+			go f.gatherer.StartGatheringData()
 		}
 	}
 
@@ -209,12 +262,30 @@ func (f *Framework) BeforeEach() {
 		f.logsSizeWaitGroup = sync.WaitGroup{}
 		f.logsSizeWaitGroup.Add(1)
 		f.logsSizeCloseChannel = make(chan bool)
-		f.logsSizeVerifier = NewLogsVerifier(f.Client, f.logsSizeCloseChannel)
+		f.logsSizeVerifier = NewLogsVerifier(f.ClientSet, f.logsSizeCloseChannel)
 		go func() {
 			f.logsSizeVerifier.Run()
 			f.logsSizeWaitGroup.Done()
 		}()
 	}
+
+	gatherMetricsAfterTest := TestContext.GatherMetricsAfterTest == "true" || TestContext.GatherMetricsAfterTest == "master"
+	if gatherMetricsAfterTest && TestContext.IncludeClusterAutoscalerMetrics {
+		grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, !ProviderIs("kubemark"), false, false, false, TestContext.IncludeClusterAutoscalerMetrics)
+		if err != nil {
+			Logf("Failed to create MetricsGrabber (skipping ClusterAutoscaler metrics gathering before test): %v", err)
+		} else {
+			f.clusterAutoscalerMetricsBeforeTest, err = grabber.Grab()
+			if err != nil {
+				Logf("MetricsGrabber failed to grab CA metrics before test (skipping metrics gathering): %v", err)
+			} else {
+				Logf("Gathered ClusterAutoscaler metrics before test")
+			}
+		}
+
+	}
+
+	f.flakeReport = NewFlakeReport()
 }
 
 // AfterEach deletes the namespace, after reading its events.
@@ -224,219 +295,191 @@ func (f *Framework) AfterEach() {
 	// DeleteNamespace at the very end in defer, to avoid any
 	// expectation failures preventing deleting the namespace.
 	defer func() {
-		if TestContext.DeleteNamespace {
+		nsDeletionErrors := map[string]error{}
+		// Whether to delete namespace is determined by 3 factors: delete-namespace flag, delete-namespace-on-failure flag and the test result
+		// if delete-namespace set to false, namespace will always be preserved.
+		// if delete-namespace is true and delete-namespace-on-failure is false, namespace will be preserved if test failed.
+		if TestContext.DeleteNamespace && (TestContext.DeleteNamespaceOnFailure || !ginkgo.CurrentGinkgoTestDescription().Failed) {
 			for _, ns := range f.namespacesToDelete {
-				By(fmt.Sprintf("Destroying namespace %q for this suite.", ns.Name))
-
-				timeout := 5 * time.Minute
+				ginkgo.By(fmt.Sprintf("Destroying namespace %q for this suite.", ns.Name))
+				timeout := DefaultNamespaceDeletionTimeout
 				if f.NamespaceDeletionTimeout != 0 {
 					timeout = f.NamespaceDeletionTimeout
 				}
-				if err := deleteNS(f.Client, ns.Name, timeout); err != nil {
-					if !apierrs.IsNotFound(err) {
-						Failf("Couldn't delete ns %q: %s", ns.Name, err)
+				if err := deleteNS(f.ClientSet, f.DynamicClient, ns.Name, timeout); err != nil {
+					if !apierrors.IsNotFound(err) {
+						nsDeletionErrors[ns.Name] = err
 					} else {
 						Logf("Namespace %v was already deleted", ns.Name)
 					}
 				}
 			}
-			f.namespacesToDelete = nil
 		} else {
-			Logf("Found DeleteNamespace=false, skipping namespace deletion!")
+			if !TestContext.DeleteNamespace {
+				Logf("Found DeleteNamespace=false, skipping namespace deletion!")
+			} else {
+				Logf("Found DeleteNamespaceOnFailure=false and current test failed, skipping namespace deletion!")
+			}
 		}
 
 		// Paranoia-- prevent reuse!
 		f.Namespace = nil
-		f.Client = nil
+		f.ClientSet = nil
+		f.namespacesToDelete = nil
+
+		// if we had errors deleting, report them now.
+		if len(nsDeletionErrors) != 0 {
+			messages := []string{}
+			for namespaceKey, namespaceErr := range nsDeletionErrors {
+				messages = append(messages, fmt.Sprintf("Couldn't delete ns: %q: %s (%#v)", namespaceKey, namespaceErr, namespaceErr))
+			}
+			Failf(strings.Join(messages, ","))
+		}
 	}()
 
-	if f.federated {
-		defer func() {
-			if f.FederationClient == nil {
-				Logf("Warning: framework is marked federated, but has no federation client")
-				return
-			}
-			if f.FederationClientset == nil {
-				Logf("Warning: framework is marked federated, but has no federation clientset")
-				return
-			}
-			if err := f.FederationClient.Clusters().DeleteCollection(nil, api.ListOptions{}); err != nil {
-				Logf("Error: failed to delete Clusters: %+v", err)
-			}
-		}()
-	}
-
 	// Print events if the test failed.
-	if CurrentGinkgoTestDescription().Failed && TestContext.DumpLogsOnFailure {
-		DumpAllNamespaceInfo(f.Client, f.Namespace.Name)
-		By(fmt.Sprintf("Dumping a list of prepulled images on each node"))
-		LogContainersInPodsWithLabels(f.Client, api.NamespaceSystem, ImagePullerLabels, "image-puller")
-		if f.federated {
-			// Print logs of federation control plane pods (federation-apiserver and federation-controller-manager)
-			LogPodsWithLabels(f.Client, "federation", map[string]string{"app": "federated-cluster"})
-			// Print logs of kube-dns pod
-			LogPodsWithLabels(f.Client, "kube-system", map[string]string{"k8s-app": "kube-dns"})
+	if ginkgo.CurrentGinkgoTestDescription().Failed && TestContext.DumpLogsOnFailure {
+		// Pass both unversioned client and versioned clientset, till we have removed all uses of the unversioned client.
+		if !f.SkipNamespaceCreation {
+			DumpAllNamespaceInfo(f.ClientSet, f.Namespace.Name)
 		}
 	}
 
-	summaries := make([]TestDataSummary, 0)
 	if TestContext.GatherKubeSystemResourceUsageData != "false" && TestContext.GatherKubeSystemResourceUsageData != "none" && f.gatherer != nil {
-		By("Collecting resource usage data")
-		summaries = append(summaries, f.gatherer.stopAndSummarize([]int{90, 99, 100}, f.AddonResourceConstraints))
+		ginkgo.By("Collecting resource usage data")
+		summary, resourceViolationError := f.gatherer.StopAndSummarize([]int{90, 99, 100}, f.AddonResourceConstraints)
+		defer ExpectNoError(resourceViolationError)
+		f.TestSummaries = append(f.TestSummaries, summary)
 	}
 
 	if TestContext.GatherLogsSizes {
-		By("Gathering log sizes data")
+		ginkgo.By("Gathering log sizes data")
 		close(f.logsSizeCloseChannel)
 		f.logsSizeWaitGroup.Wait()
-		summaries = append(summaries, f.logsSizeVerifier.GetSummary())
+		f.TestSummaries = append(f.TestSummaries, f.logsSizeVerifier.GetSummary())
 	}
 
-	if TestContext.GatherMetricsAfterTest {
-		By("Gathering metrics")
-		// TODO: enable Scheduler and ControllerManager metrics grabbing when Master's Kubelet will be registered.
-		grabber, err := metrics.NewMetricsGrabber(f.Client, true, false, false, true)
+	if TestContext.GatherMetricsAfterTest != "false" {
+		ginkgo.By("Gathering metrics")
+		// Grab apiserver, scheduler, controller-manager metrics and (optionally) nodes' kubelet metrics.
+		grabMetricsFromKubelets := TestContext.GatherMetricsAfterTest != "master" && !ProviderIs("kubemark")
+		grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, grabMetricsFromKubelets, true, true, true, TestContext.IncludeClusterAutoscalerMetrics)
 		if err != nil {
-			Logf("Failed to create MetricsGrabber. Skipping metrics gathering.")
+			Logf("Failed to create MetricsGrabber (skipping metrics gathering): %v", err)
 		} else {
 			received, err := grabber.Grab()
 			if err != nil {
-				Logf("MetricsGrabber failed grab metrics. Skipping metrics gathering.")
-			} else {
-				summaries = append(summaries, (*MetricsForE2E)(&received))
+				Logf("MetricsGrabber failed to grab some of the metrics: %v", err)
 			}
+			(*e2emetrics.ComponentCollection)(&received).ComputeClusterAutoscalerMetricsDelta(f.clusterAutoscalerMetricsBeforeTest)
+			f.TestSummaries = append(f.TestSummaries, (*e2emetrics.ComponentCollection)(&received))
 		}
 	}
 
-	outputTypes := strings.Split(TestContext.OutputPrintType, ",")
-	for _, printType := range outputTypes {
-		switch printType {
-		case "hr":
-			for i := range summaries {
-				Logf(summaries[i].PrintHumanReadable())
-			}
-		case "json":
-			for i := range summaries {
-				typeName := reflect.TypeOf(summaries[i]).String()
-				Logf("%v JSON\n%v", typeName[strings.LastIndex(typeName, ".")+1:], summaries[i].PrintJSON())
-				Logf("Finished")
-			}
-		default:
-			Logf("Unknown output type: %v. Skipping.", printType)
-		}
+	TestContext.CloudConfig.Provider.FrameworkAfterEach(f)
+
+	// Report any flakes that were observed in the e2e test and reset.
+	if f.flakeReport != nil && f.flakeReport.GetFlakeCount() > 0 {
+		f.TestSummaries = append(f.TestSummaries, f.flakeReport)
+		f.flakeReport = nil
 	}
+
+	PrintSummaries(f.TestSummaries, f.BaseName)
 
 	// Check whether all nodes are ready after the test.
 	// This is explicitly done at the very end of the test, to avoid
 	// e.g. not removing namespace in case of this failure.
-	if err := AllNodesReady(f.Client, time.Minute); err != nil {
+	if err := AllNodesReady(f.ClientSet, 3*time.Minute); err != nil {
 		Failf("All nodes should be ready after test, %v", err)
 	}
 }
 
-func (f *Framework) CreateNamespace(baseName string, labels map[string]string) (*api.Namespace, error) {
+// CreateNamespace creates a namespace for e2e testing.
+func (f *Framework) CreateNamespace(baseName string, labels map[string]string) (*v1.Namespace, error) {
 	createTestingNS := TestContext.CreateTestingNS
 	if createTestingNS == nil {
 		createTestingNS = CreateTestingNS
 	}
-	ns, err := createTestingNS(baseName, f.Client, labels)
-	if err == nil {
-		f.namespacesToDelete = append(f.namespacesToDelete, ns)
+	ns, err := createTestingNS(baseName, f.ClientSet, labels)
+	// check ns instead of err to see if it's nil as we may
+	// fail to create serviceAccount in it.
+	f.AddNamespacesToDelete(ns)
+
+	if err == nil && !f.SkipPrivilegedPSPBinding {
+		e2epsp.CreatePrivilegedPSPBinding(f.ClientSet, ns.Name)
 	}
+
 	return ns, err
+}
+
+// RecordFlakeIfError records flakeness info if error happens.
+// NOTE: This function is not used at any places yet, but we are in progress for https://github.com/kubernetes/kubernetes/issues/66239 which requires this. Please don't remove this.
+func (f *Framework) RecordFlakeIfError(err error, optionalDescription ...interface{}) {
+	f.flakeReport.RecordFlakeIfError(err, optionalDescription)
+}
+
+// AddNamespacesToDelete adds one or more namespaces to be deleted when the test
+// completes.
+func (f *Framework) AddNamespacesToDelete(namespaces ...*v1.Namespace) {
+	for _, ns := range namespaces {
+		if ns == nil {
+			continue
+		}
+		f.namespacesToDelete = append(f.namespacesToDelete, ns)
+
+	}
 }
 
 // WaitForPodTerminated waits for the pod to be terminated with the given reason.
 func (f *Framework) WaitForPodTerminated(podName, reason string) error {
-	return waitForPodTerminatedInNamespace(f.Client, podName, reason, f.Namespace.Name)
+	return e2epod.WaitForPodTerminatedInNamespace(f.ClientSet, podName, reason, f.Namespace.Name)
+}
+
+// WaitForPodNotFound waits for the pod to be completely terminated (not "Get-able").
+func (f *Framework) WaitForPodNotFound(podName string, timeout time.Duration) error {
+	return e2epod.WaitForPodNotFoundInNamespace(f.ClientSet, podName, f.Namespace.Name, timeout)
 }
 
 // WaitForPodRunning waits for the pod to run in the namespace.
 func (f *Framework) WaitForPodRunning(podName string) error {
-	return WaitForPodNameRunningInNamespace(f.Client, podName, f.Namespace.Name)
+	return e2epod.WaitForPodNameRunningInNamespace(f.ClientSet, podName, f.Namespace.Name)
 }
 
 // WaitForPodReady waits for the pod to flip to ready in the namespace.
 func (f *Framework) WaitForPodReady(podName string) error {
-	return waitTimeoutForPodReadyInNamespace(f.Client, podName, f.Namespace.Name, "", PodStartTimeout)
+	return e2epod.WaitTimeoutForPodReadyInNamespace(f.ClientSet, podName, f.Namespace.Name, PodStartTimeout)
 }
 
 // WaitForPodRunningSlow waits for the pod to run in the namespace.
 // It has a longer timeout then WaitForPodRunning (util.slowPodStartTimeout).
 func (f *Framework) WaitForPodRunningSlow(podName string) error {
-	return waitForPodRunningInNamespaceSlow(f.Client, podName, f.Namespace.Name, "")
+	return e2epod.WaitForPodRunningInNamespaceSlow(f.ClientSet, podName, f.Namespace.Name)
 }
 
 // WaitForPodNoLongerRunning waits for the pod to no longer be running in the namespace, for either
 // success or failure.
 func (f *Framework) WaitForPodNoLongerRunning(podName string) error {
-	return WaitForPodNoLongerRunningInNamespace(f.Client, podName, f.Namespace.Name, "")
+	return e2epod.WaitForPodNoLongerRunningInNamespace(f.ClientSet, podName, f.Namespace.Name)
 }
 
 // TestContainerOutput runs the given pod in the given namespace and waits
 // for all of the containers in the podSpec to move into the 'Success' status, and tests
 // the specified container log against the given expected output using a substring matcher.
-func (f *Framework) TestContainerOutput(scenarioName string, pod *api.Pod, containerIndex int, expectedOutput []string) {
-	f.testContainerOutputMatcher(scenarioName, pod, containerIndex, expectedOutput, ContainSubstring)
+func (f *Framework) TestContainerOutput(scenarioName string, pod *v1.Pod, containerIndex int, expectedOutput []string) {
+	f.testContainerOutputMatcher(scenarioName, pod, containerIndex, expectedOutput, gomega.ContainSubstring)
 }
 
 // TestContainerOutputRegexp runs the given pod in the given namespace and waits
 // for all of the containers in the podSpec to move into the 'Success' status, and tests
 // the specified container log against the given expected output using a regexp matcher.
-func (f *Framework) TestContainerOutputRegexp(scenarioName string, pod *api.Pod, containerIndex int, expectedOutput []string) {
-	f.testContainerOutputMatcher(scenarioName, pod, containerIndex, expectedOutput, MatchRegexp)
+func (f *Framework) TestContainerOutputRegexp(scenarioName string, pod *v1.Pod, containerIndex int, expectedOutput []string) {
+	f.testContainerOutputMatcher(scenarioName, pod, containerIndex, expectedOutput, gomega.MatchRegexp)
 }
 
-// WaitForAnEndpoint waits for at least one endpoint to become available in the
-// service's corresponding endpoints object.
-func (f *Framework) WaitForAnEndpoint(serviceName string) error {
-	for {
-		// TODO: Endpoints client should take a field selector so we
-		// don't have to list everything.
-		list, err := f.Client.Endpoints(f.Namespace.Name).List(api.ListOptions{})
-		if err != nil {
-			return err
-		}
-		rv := list.ResourceVersion
-
-		isOK := func(e *api.Endpoints) bool {
-			return e.Name == serviceName && len(e.Subsets) > 0 && len(e.Subsets[0].Addresses) > 0
-		}
-		for i := range list.Items {
-			if isOK(&list.Items[i]) {
-				return nil
-			}
-		}
-
-		options := api.ListOptions{
-			FieldSelector:   fields.Set{"metadata.name": serviceName}.AsSelector(),
-			ResourceVersion: rv,
-		}
-		w, err := f.Client.Endpoints(f.Namespace.Name).Watch(options)
-		if err != nil {
-			return err
-		}
-		defer w.Stop()
-
-		for {
-			val, ok := <-w.ResultChan()
-			if !ok {
-				// reget and re-watch
-				break
-			}
-			if e, ok := val.Object.(*api.Endpoints); ok {
-				if isOK(e) {
-					return nil
-				}
-			}
-		}
-	}
-}
-
-// Write a file using kubectl exec echo <contents> > <path> via specified container
-// Because of the primitive technique we're using here, we only allow ASCII alphanumeric characters
+// WriteFileViaContainer writes a file using kubectl exec echo <contents> > <path> via specified container
+// because of the primitive technique we're using here, we only allow ASCII alphanumeric characters
 func (f *Framework) WriteFileViaContainer(podName, containerName string, path string, contents string) error {
-	By("writing a file in the container")
+	ginkgo.By("writing a file in the container")
 	allowedCharacters := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	for _, c := range contents {
 		if !strings.ContainsRune(allowedCharacters, c) {
@@ -451,9 +494,9 @@ func (f *Framework) WriteFileViaContainer(podName, containerName string, path st
 	return err
 }
 
-// Read a file using kubectl exec cat <path>
+// ReadFileViaContainer reads a file using kubectl exec cat <path>.
 func (f *Framework) ReadFileViaContainer(podName, containerName string, path string) (string, error) {
-	By("reading a file in the container")
+	ginkgo.By("reading a file in the container")
 
 	stdout, stderr, err := kubectlExecWithRetry(f.Namespace.Name, podName, containerName, "--", "cat", path)
 	if err != nil {
@@ -462,19 +505,30 @@ func (f *Framework) ReadFileViaContainer(podName, containerName string, path str
 	return string(stdout), err
 }
 
+// CheckFileSizeViaContainer returns the list of file size under the specified path.
+func (f *Framework) CheckFileSizeViaContainer(podName, containerName, path string) (string, error) {
+	ginkgo.By("checking a file size in the container")
+
+	stdout, stderr, err := kubectlExecWithRetry(f.Namespace.Name, podName, containerName, "--", "ls", "-l", path)
+	if err != nil {
+		Logf("error running kubectl exec to read file: %v\nstdout=%v\nstderr=%v)", err, string(stdout), string(stderr))
+	}
+	return string(stdout), err
+}
+
 // CreateServiceForSimpleAppWithPods is a convenience wrapper to create a service and its matching pods all at once.
-func (f *Framework) CreateServiceForSimpleAppWithPods(contPort int, svcPort int, appName string, podSpec func(n api.Node) api.PodSpec, count int, block bool) (error, *api.Service) {
-	var err error = nil
+func (f *Framework) CreateServiceForSimpleAppWithPods(contPort int, svcPort int, appName string, podSpec func(n v1.Node) v1.PodSpec, count int, block bool) (*v1.Service, error) {
+	var err error
 	theService := f.CreateServiceForSimpleApp(contPort, svcPort, appName)
 	f.CreatePodsPerNodeForSimpleApp(appName, podSpec, count)
 	if block {
-		err = WaitForPodsWithLabelRunning(f.Client, f.Namespace.Name, labels.SelectorFromSet(labels.Set(theService.Spec.Selector)))
+		err = testutils.WaitForPodsWithLabelRunning(f.ClientSet, f.Namespace.Name, labels.SelectorFromSet(labels.Set(theService.Spec.Selector)))
 	}
-	return err, theService
+	return theService, err
 }
 
 // CreateServiceForSimpleApp returns a service that selects/exposes pods (send -1 ports if no exposure needed) with an app label.
-func (f *Framework) CreateServiceForSimpleApp(contPort, svcPort int, appName string) *api.Service {
+func (f *Framework) CreateServiceForSimpleApp(contPort, svcPort int, appName string) *v1.Service {
 	if appName == "" {
 		panic(fmt.Sprintf("no app name provided"))
 	}
@@ -484,26 +538,25 @@ func (f *Framework) CreateServiceForSimpleApp(contPort, svcPort int, appName str
 	}
 
 	// For convenience, user sending ports are optional.
-	portsFunc := func() []api.ServicePort {
+	portsFunc := func() []v1.ServicePort {
 		if contPort < 1 || svcPort < 1 {
 			return nil
-		} else {
-			return []api.ServicePort{{
-				Protocol:   "TCP",
-				Port:       int32(svcPort),
-				TargetPort: intstr.FromInt(contPort),
-			}}
 		}
+		return []v1.ServicePort{{
+			Protocol:   v1.ProtocolTCP,
+			Port:       int32(svcPort),
+			TargetPort: intstr.FromInt(contPort),
+		}}
 	}
 	Logf("Creating a service-for-%v for selecting app=%v-pod", appName, appName)
-	service, err := f.Client.Services(f.Namespace.Name).Create(&api.Service{
-		ObjectMeta: api.ObjectMeta{
+	service, err := f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "service-for-" + appName,
 			Labels: map[string]string{
 				"app": appName + "-service",
 			},
 		},
-		Spec: api.ServiceSpec{
+		Spec: v1.ServiceSpec{
 			Ports:    portsFunc(),
 			Selector: serviceSelector,
 		},
@@ -512,29 +565,30 @@ func (f *Framework) CreateServiceForSimpleApp(contPort, svcPort int, appName str
 	return service
 }
 
-// CreatePodsPerNodeForSimpleApp Creates pods w/ labels.  Useful for tests which make a bunch of pods w/o any networking.
-func (f *Framework) CreatePodsPerNodeForSimpleApp(appName string, podSpec func(n api.Node) api.PodSpec, maxCount int) map[string]string {
-	nodes := GetReadySchedulableNodesOrDie(f.Client)
-	labels := map[string]string{
+// CreatePodsPerNodeForSimpleApp creates pods w/ labels.  Useful for tests which make a bunch of pods w/o any networking.
+func (f *Framework) CreatePodsPerNodeForSimpleApp(appName string, podSpec func(n v1.Node) v1.PodSpec, maxCount int) map[string]string {
+	nodes := GetReadySchedulableNodesOrDie(f.ClientSet)
+	podLabels := map[string]string{
 		"app": appName + "-pod",
 	}
 	for i, node := range nodes.Items {
 		// one per node, but no more than maxCount.
 		if i <= maxCount {
 			Logf("%v/%v : Creating container with label app=%v-pod", i, maxCount, appName)
-			_, err := f.Client.Pods(f.Namespace.Name).Create(&api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			_, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:   fmt.Sprintf(appName+"-pod-%v", i),
-					Labels: labels,
+					Labels: podLabels,
 				},
 				Spec: podSpec(node),
 			})
 			ExpectNoError(err)
 		}
 	}
-	return labels
+	return podLabels
 }
 
+// KubeUser is a struct for managing kubernetes user info.
 type KubeUser struct {
 	Name string `yaml:"name"`
 	User struct {
@@ -544,6 +598,7 @@ type KubeUser struct {
 	} `yaml:"user"`
 }
 
+// KubeCluster is a struct for managing kubernetes cluster info.
 type KubeCluster struct {
 	Name    string `yaml:"name"`
 	Cluster struct {
@@ -552,6 +607,7 @@ type KubeCluster struct {
 	} `yaml:"cluster"`
 }
 
+// KubeConfig is a struct for managing kubernetes config.
 type KubeConfig struct {
 	Contexts []struct {
 		Name    string `yaml:"name"`
@@ -566,7 +622,8 @@ type KubeConfig struct {
 	Users []KubeUser `yaml:"users"`
 }
 
-func (kc *KubeConfig) findUser(name string) *KubeUser {
+// FindUser returns user info which is the specified user name.
+func (kc *KubeConfig) FindUser(name string) *KubeUser {
 	for _, user := range kc.Users {
 		if user.Name == name {
 			return &user
@@ -575,63 +632,14 @@ func (kc *KubeConfig) findUser(name string) *KubeUser {
 	return nil
 }
 
-func (kc *KubeConfig) findCluster(name string) *KubeCluster {
+// FindCluster returns cluster info which is the specified cluster name.
+func (kc *KubeConfig) FindCluster(name string) *KubeCluster {
 	for _, cluster := range kc.Clusters {
 		if cluster.Name == name {
 			return &cluster
 		}
 	}
 	return nil
-}
-
-type E2EContext struct {
-	// Raw context name,
-	RawName string `yaml:"rawName"`
-	// A valid dns subdomain which can be used as the name of kubernetes resources.
-	Name    string       `yaml:"name"`
-	Cluster *KubeCluster `yaml:"cluster"`
-	User    *KubeUser    `yaml:"user"`
-}
-
-func (f *Framework) GetUnderlyingFederatedContexts() []E2EContext {
-	if !f.federated {
-		Failf("geUnderlyingFederatedContexts called on non-federated framework")
-	}
-
-	kubeconfig := KubeConfig{}
-	configBytes, err := ioutil.ReadFile(TestContext.KubeConfig)
-	ExpectNoError(err)
-	err = yaml.Unmarshal(configBytes, &kubeconfig)
-	ExpectNoError(err)
-
-	e2eContexts := []E2EContext{}
-	for _, context := range kubeconfig.Contexts {
-		if strings.HasPrefix(context.Name, "federation") && context.Name != "federation-cluster" {
-
-			user := kubeconfig.findUser(context.Context.User)
-			if user == nil {
-				Failf("Could not find user for context %+v", context)
-			}
-
-			cluster := kubeconfig.findCluster(context.Context.Cluster)
-			if cluster == nil {
-				Failf("Could not find cluster for context %+v", context)
-			}
-
-			dnsSubdomainName, err := GetValidDNSSubdomainName(context.Name)
-			if err != nil {
-				Failf("Could not convert context name %s to a valid dns subdomain name, error: %s", context.Name, err)
-			}
-			e2eContexts = append(e2eContexts, E2EContext{
-				RawName: context.Name,
-				Name:    dnsSubdomainName,
-				Cluster: cluster,
-				User:    user,
-			})
-		}
-	}
-
-	return e2eContexts
 }
 
 func kubectlExecWithRetry(namespace string, podName, containerName string, args ...string) ([]byte, []byte, error) {
@@ -657,7 +665,7 @@ func kubectlExecWithRetry(namespace string, podName, containerName string, args 
 
 		return stdOutBytes, stdErrBytes, err
 	}
-	err := fmt.Errorf("Failed: kubectl exec failed %d times with \"i/o timeout\". Giving up.", maxKubectlExecRetries)
+	err := fmt.Errorf("Failed: kubectl exec failed %d times with \"i/o timeout\". Giving up", maxKubectlExecRetries)
 	return nil, nil, err
 }
 
@@ -679,10 +687,15 @@ func kubectlExec(namespace string, podName, containerName string, args ...string
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
-// Wrapper function for ginkgo describe.  Adds namespacing.
+// KubeDescribe is wrapper function for ginkgo describe.  Adds namespacing.
 // TODO: Support type safe tagging as well https://github.com/kubernetes/kubernetes/pull/22401.
 func KubeDescribe(text string, body func()) bool {
-	return Describe("[k8s.io] "+text, body)
+	return ginkgo.Describe("[k8s.io] "+text, body)
+}
+
+// ConformanceIt is wrapper function for ginkgo It.  Adds "[Conformance]" tag and makes static analysis easier.
+func ConformanceIt(text string, body interface{}, timeout ...float64) bool {
+	return ginkgo.It(text+" [Conformance]", body, timeout...)
 }
 
 // PodStateVerification represents a verification of pod state.
@@ -693,52 +706,53 @@ type PodStateVerification struct {
 	Selectors map[string]string
 
 	// Required: The phases which are valid for your pod.
-	ValidPhases []api.PodPhase
+	ValidPhases []v1.PodPhase
 
 	// Optional: only pods passing this function will pass the filter
 	// Verify a pod.
-	// As an optimization, in addition to specfying filter (boolean),
+	// As an optimization, in addition to specifying filter (boolean),
 	// this function allows specifying an error as well.
 	// The error indicates that the polling of the pod spectrum should stop.
-	Verify func(api.Pod) (bool, error)
+	Verify func(v1.Pod) (bool, error)
 
 	// Optional: only pods with this name will pass the filter.
 	PodName string
 }
 
+// ClusterVerification is a struct for a verification of cluster state.
 type ClusterVerification struct {
-	client    *client.Client
-	namespace *api.Namespace // pointer rather than string, since ns isn't created until before each.
+	client    clientset.Interface
+	namespace *v1.Namespace // pointer rather than string, since ns isn't created until before each.
 	podState  PodStateVerification
 }
 
-func (f *Framework) NewClusterVerification(filter PodStateVerification) *ClusterVerification {
+// NewClusterVerification creates a new cluster verification.
+func (f *Framework) NewClusterVerification(namespace *v1.Namespace, filter PodStateVerification) *ClusterVerification {
 	return &ClusterVerification{
-		f.Client,
-		f.Namespace,
+		f.ClientSet,
+		namespace,
 		filter,
 	}
 }
 
-func passesPodNameFilter(pod api.Pod, name string) bool {
+func passesPodNameFilter(pod v1.Pod, name string) bool {
 	return name == "" || strings.Contains(pod.Name, name)
 }
 
-func passesVerifyFilter(pod api.Pod, verify func(p api.Pod) (bool, error)) (bool, error) {
+func passesVerifyFilter(pod v1.Pod, verify func(p v1.Pod) (bool, error)) (bool, error) {
 	if verify == nil {
 		return true, nil
-	} else {
-		verified, err := verify(pod)
-		// If an error is returned, by definition, pod verification fails
-		if err != nil {
-			return false, err
-		} else {
-			return verified, nil
-		}
 	}
+
+	verified, err := verify(pod)
+	// If an error is returned, by definition, pod verification fails
+	if err != nil {
+		return false, err
+	}
+	return verified, nil
 }
 
-func passesPhasesFilter(pod api.Pod, validPhases []api.PodPhase) bool {
+func passesPhasesFilter(pod v1.Pod, validPhases []v1.PodPhase) bool {
 	passesPhaseFilter := false
 	for _, phase := range validPhases {
 		if pod.Status.Phase == phase {
@@ -749,18 +763,18 @@ func passesPhasesFilter(pod api.Pod, validPhases []api.PodPhase) bool {
 }
 
 // filterLabels returns a list of pods which have labels.
-func filterLabels(selectors map[string]string, cli *client.Client, ns string) (*api.PodList, error) {
+func filterLabels(selectors map[string]string, cli clientset.Interface, ns string) (*v1.PodList, error) {
 	var err error
 	var selector labels.Selector
-	var pl *api.PodList
+	var pl *v1.PodList
 	// List pods based on selectors.  This might be a tiny optimization rather then filtering
 	// everything manually.
 	if len(selectors) > 0 {
 		selector = labels.SelectorFromSet(labels.Set(selectors))
-		options := api.ListOptions{LabelSelector: selector}
-		pl, err = cli.Pods(ns).List(options)
+		options := metav1.ListOptions{LabelSelector: selector.String()}
+		pl, err = cli.CoreV1().Pods(ns).List(options)
 	} else {
-		pl, err = cli.Pods(ns).List(api.ListOptions{})
+		pl, err = cli.CoreV1().Pods(ns).List(metav1.ListOptions{})
 	}
 	return pl, err
 }
@@ -768,20 +782,20 @@ func filterLabels(selectors map[string]string, cli *client.Client, ns string) (*
 // filter filters pods which pass a filter.  It can be used to compose
 // the more useful abstractions like ForEach, WaitFor, and so on, which
 // can be used directly by tests.
-func (p *PodStateVerification) filter(c *client.Client, namespace *api.Namespace) ([]api.Pod, error) {
+func (p *PodStateVerification) filter(c clientset.Interface, namespace *v1.Namespace) ([]v1.Pod, error) {
 	if len(p.ValidPhases) == 0 || namespace == nil {
 		panic(fmt.Errorf("Need to specify a valid pod phases (%v) and namespace (%v). ", p.ValidPhases, namespace))
 	}
 
 	ns := namespace.Name
-	pl, err := filterLabels(p.Selectors, c, ns) // Build an api.PodList to operate against.
+	pl, err := filterLabels(p.Selectors, c, ns) // Build an v1.PodList to operate against.
 	Logf("Selector matched %v pods for %v", len(pl.Items), p.Selectors)
 	if len(pl.Items) == 0 || err != nil {
 		return pl.Items, err
 	}
 
 	unfilteredPods := pl.Items
-	filteredPods := []api.Pod{}
+	filteredPods := []v1.Pod{}
 ReturnPodsSoFar:
 	// Next: Pod must match at least one of the states that the user specified
 	for _, pod := range unfilteredPods {
@@ -802,8 +816,8 @@ ReturnPodsSoFar:
 
 // WaitFor waits for some minimum number of pods to be verified, according to the PodStateVerification
 // definition.
-func (cl *ClusterVerification) WaitFor(atLeast int, timeout time.Duration) ([]api.Pod, error) {
-	pods := []api.Pod{}
+func (cl *ClusterVerification) WaitFor(atLeast int, timeout time.Duration) ([]v1.Pod, error) {
+	pods := []v1.Pod{}
 	var returnedErr error
 
 	err := wait.Poll(1*time.Second, timeout, func() (bool, error) {
@@ -837,12 +851,12 @@ func (cl *ClusterVerification) WaitForOrFail(atLeast int, timeout time.Duration)
 	}
 }
 
-// ForEach runs a function against every verifiable pod.  Be warned that this doesn't wait for "n" pods to verifiy,
+// ForEach runs a function against every verifiable pod.  Be warned that this doesn't wait for "n" pods to verify,
 // so it may return very quickly if you have strict pod state requirements.
 //
 // For example, if you require at least 5 pods to be running before your test will pass,
 // its smart to first call "clusterVerification.WaitFor(5)" before you call clusterVerification.ForEach.
-func (cl *ClusterVerification) ForEach(podFunc func(api.Pod)) error {
+func (cl *ClusterVerification) ForEach(podFunc func(v1.Pod)) error {
 	pods, err := cl.podState.filter(cl.client, cl.namespace)
 	if err == nil {
 		if len(pods) == 0 {
@@ -857,4 +871,31 @@ func (cl *ClusterVerification) ForEach(podFunc func(api.Pod)) error {
 	}
 
 	return err
+}
+
+// GetLogToFileFunc is a convenience function that returns a function that have the same interface as
+// e2elog.Logf, but writes to a specified file.
+func GetLogToFileFunc(file *os.File) func(format string, args ...interface{}) {
+	return func(format string, args ...interface{}) {
+		writer := bufio.NewWriter(file)
+		if _, err := fmt.Fprintf(writer, format, args...); err != nil {
+			Logf("Failed to write file %v with test performance data: %v", file.Name(), err)
+		}
+		writer.Flush()
+	}
+}
+
+const (
+	// preconfiguredRuntimeHandler is the name of the runtime handler that is expected to be
+	// preconfigured in the test environment.
+	preconfiguredRuntimeHandler = "test-handler"
+)
+
+// PreconfiguredRuntimeClassHandler returns configured runtime handler.
+func PreconfiguredRuntimeClassHandler() string {
+	if TestContext.ContainerRuntime == "docker" {
+		return TestContext.ContainerRuntime
+	}
+
+	return preconfiguredRuntimeHandler
 }

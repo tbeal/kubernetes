@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,7 +114,7 @@ func (l *DefaultLogger) Fatalf(format string, v ...interface{}) {
 }
 
 func (l *DefaultLogger) Panic(v ...interface{}) {
-	l.Logger.Panic(v)
+	l.Logger.Panic(v...)
 }
 
 func (l *DefaultLogger) Panicf(format string, v ...interface{}) {
